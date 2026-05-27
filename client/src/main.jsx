@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import axios from "axios";
@@ -8,18 +8,23 @@ import {
   AlertTriangle,
   BarChart3,
   Bell,
+  CheckCircle,
   Download,
   FileSpreadsheet,
   Home,
   LineChart,
   LogOut,
+  PauseCircle,
   PlusCircle,
+  Radio,
   RefreshCw,
   Search,
   Settings,
   Shield,
   Sparkles,
+  Trash2,
   Upload,
+  Wifi,
   Users
 } from "lucide-react";
 import {
@@ -104,6 +109,7 @@ function Shell({ children, admin = false }) {
         ["/admin", Home, "Overview"],
         ["/admin/users", Users, "Users"],
         ["/admin/topics", Search, "Topics"],
+        ["/admin/sources", Radio, "Sources"],
         ["/admin/uploads", Upload, "Uploads"],
         ["/admin/reports", FileSpreadsheet, "Reports"],
         ["/admin/alerts", Bell, "Alerts"],
@@ -112,12 +118,14 @@ function Shell({ children, admin = false }) {
     : [
         ["/dashboard", Home, "Dashboard"],
         ["/topics/new", PlusCircle, "Add Topic"],
+        ["/sources", Radio, "Live Sources"],
         ["/monitoring", Activity, "Monitoring"],
         ["/sentiment", BarChart3, "Sentiment"],
         ["/summary", Sparkles, "AI Summary"],
         ["/alerts", Bell, "Alerts"],
         ["/reports", Download, "Reports"],
         ["/competitors", LineChart, "Competitors"],
+        ["/setup", CheckCircle, "Setup"],
         ["/settings", Settings, "Settings"]
       ];
 
@@ -272,14 +280,28 @@ function Stat({ label, value, icon: Icon }) {
   );
 }
 
+function useLiveRefresh(onEvent) {
+  useEffect(() => {
+    const token = localStorage.getItem("opiniontrack_token");
+    if (!token) return;
+    const stream = new EventSource(`${API_URL}/live/events?token=${encodeURIComponent(token)}`);
+    stream.onmessage = (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type !== "connected") onEvent?.(payload);
+    };
+    return () => stream.close();
+  }, [onEvent]);
+}
+
 function useOverview() {
   const [data, setData] = useState(null);
-  const load = () => api.get("/analytics/overview").then(({ data }) => setData(data));
+  const load = useCallback(() => api.get("/analytics/overview").then(({ data }) => setData(data)), []);
   useEffect(() => {
     load();
     const timer = setInterval(load, 20000);
     return () => clearInterval(timer);
-  }, []);
+  }, [load]);
+  useLiveRefresh(load);
   return { data, reload: load };
 }
 
@@ -345,13 +367,13 @@ function SentimentPie({ data }) {
 }
 
 function TopicForm() {
-  const [form, setForm] = useState({ name: "", type: "keyword", description: "", color: "#0ea5e9" });
+  const [form, setForm] = useState({ name: "", type: "keyword", description: "", color: "#0ea5e9", keywords: "" });
   const [message, setMessage] = useState("");
   async function submit(e) {
     e.preventDefault();
     await api.post("/topics", form);
     setMessage("Topic created.");
-    setForm({ name: "", type: "keyword", description: "", color: "#0ea5e9" });
+    setForm({ name: "", type: "keyword", description: "", color: "#0ea5e9", keywords: "" });
   }
   return (
     <Shell>
@@ -361,6 +383,7 @@ function TopicForm() {
         <select className="field mt-4" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
           <option value="keyword">Keyword</option><option value="hashtag">Hashtag</option><option value="brand">Brand</option><option value="competitor">Competitor</option>
         </select>
+        <input className="field mt-4" placeholder="Comma-separated live matching terms" value={form.keywords} onChange={(e) => setForm({ ...form, keywords: e.target.value })} />
         <textarea className="field mt-4" placeholder="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
         <input className="field mt-4 h-12" type="color" value={form.color} onChange={(e) => setForm({ ...form, color: e.target.value })} />
         <button className="btn-primary mt-5"><PlusCircle size={16} /> Save topic</button>
@@ -375,12 +398,13 @@ function Monitoring() {
   const [sort, setSort] = useState("recent");
   const [sentiment, setSentiment] = useState("");
   const [message, setMessage] = useState("");
-  const load = () => api.get("/posts", { params: { sort, sentiment: sentiment || undefined } }).then(({ data }) => setPosts(data));
+  const load = useCallback(() => api.get("/posts", { params: { sort, sentiment: sentiment || undefined } }).then(({ data }) => setPosts(data)), [sort, sentiment]);
   useEffect(() => {
     load();
     const timer = setInterval(load, 20000);
     return () => clearInterval(timer);
-  }, [sort, sentiment]);
+  }, [load]);
+  useLiveRefresh(load);
   async function uploadFile(e, type) {
     const file = e.target.files[0];
     if (!file) return;
@@ -480,6 +504,105 @@ function AlertsPage() {
   );
 }
 
+function LiveSourcesPage() {
+  const [sources, setSources] = useState([]);
+  const [topics, setTopics] = useState([]);
+  const [message, setMessage] = useState("");
+  const [form, setForm] = useState({
+    name: "RSS keyword monitor",
+    type: "rss",
+    topicId: "",
+    query: "social media, sentiment, analytics",
+    url: "https://hnrss.org/frontpage",
+    enabled: false,
+    pollIntervalSeconds: 300
+  });
+  const load = useCallback(() => api.get("/sources").then(({ data }) => setSources(data)), []);
+  useEffect(() => {
+    load();
+    api.get("/topics").then(({ data }) => {
+      setTopics(data);
+      setForm((current) => ({ ...current, topicId: data[0]?.id || "" }));
+    });
+  }, [load]);
+  useLiveRefresh(load);
+
+  function preset(type) {
+    if (type === "bluesky") setForm({ ...form, name: "Bluesky keyword stream", type, query: "opiniontrack, sentiment, social listening", url: "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post", enabled: false, pollIntervalSeconds: 60 });
+    if (type === "mastodon") setForm({ ...form, name: "Mastodon hashtag stream", type, query: "opensource", url: "https://mastodon.social", enabled: false, pollIntervalSeconds: 60 });
+    if (type === "rss") setForm({ ...form, name: "RSS keyword monitor", type, query: "social media, sentiment, analytics", url: "https://hnrss.org/frontpage", enabled: false, pollIntervalSeconds: 300 });
+  }
+
+  async function save(e) {
+    e.preventDefault();
+    await api.post("/sources", form);
+    setMessage("Source saved.");
+    load();
+  }
+
+  async function toggle(source) {
+    await api.put(`/sources/${source.id}`, { ...source, topicId: source.topic_id || "", pollIntervalSeconds: source.poll_interval_seconds, enabled: !source.enabled });
+    setMessage(!source.enabled ? "Live source started." : "Live source paused.");
+    load();
+  }
+
+  async function test(source) {
+    const { data } = await api.post(`/sources/${source.id}/test`);
+    setMessage(data.message || `Source OK. Sample items: ${data.sampleCount ?? 0}`);
+    load();
+  }
+
+  async function remove(source) {
+    await api.delete(`/sources/${source.id}`);
+    setMessage("Source deleted.");
+    load();
+  }
+
+  return (
+    <Shell>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div><h2 className="page-title">Live Sources</h2><p className="muted">Free near-real-time collection from Bluesky, Mastodon, and RSS.</p></div>
+        <div className="flex flex-wrap gap-2">
+          <button className="btn-secondary" onClick={() => preset("bluesky")}><Radio size={16} /> Bluesky</button>
+          <button className="btn-secondary" onClick={() => preset("mastodon")}><Wifi size={16} /> Mastodon</button>
+          <button className="btn-secondary" onClick={() => preset("rss")}><FileSpreadsheet size={16} /> RSS</button>
+        </div>
+      </div>
+      {message && <p className="mt-4 rounded-lg bg-sky-50 p-3 font-semibold text-sky-800">{message}</p>}
+      <form onSubmit={save} className="card mt-5 grid gap-3 lg:grid-cols-6">
+        <input className="field lg:col-span-2" required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <select className="field" value={form.type} onChange={(e) => preset(e.target.value)}>
+          <option value="rss">RSS</option><option value="bluesky">Bluesky</option><option value="mastodon">Mastodon</option><option value="reddit">Reddit stub</option><option value="youtube">YouTube stub</option>
+        </select>
+        <select className="field" value={form.topicId} onChange={(e) => setForm({ ...form, topicId: e.target.value })}>{topics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+        <input className="field lg:col-span-2" placeholder="Keywords or hashtag" value={form.query} onChange={(e) => setForm({ ...form, query: e.target.value })} />
+        <input className="field lg:col-span-4" placeholder="Feed, instance, or websocket URL" value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} />
+        <input className="field" type="number" min="60" value={form.pollIntervalSeconds} onChange={(e) => setForm({ ...form, pollIntervalSeconds: Number(e.target.value) })} />
+        <button className="btn-primary justify-center"><PlusCircle size={16} /> Save source</button>
+      </form>
+      <div className="card mt-5 overflow-x-auto">
+        <table className="table">
+          <thead><tr><th>Name</th><th>Type</th><th>Topic</th><th>Status</th><th>Imported</th><th>Last run</th><th>Error</th><th>Actions</th></tr></thead>
+          <tbody>
+            {sources.map((source) => (
+              <tr key={source.id}>
+                <td>{source.name}<p className="muted">{source.query}</p></td>
+                <td>{source.type}</td>
+                <td>{source.topic_name || "Any"}</td>
+                <td><Badge value={source.enabled ? source.status : "paused"} /></td>
+                <td>{source.post_count}</td>
+                <td>{source.last_run_at || ""}</td>
+                <td className="max-w-xs">{source.last_error || ""}</td>
+                <td><div className="flex flex-wrap gap-2"><button className="btn-secondary" onClick={() => toggle(source)}>{source.enabled ? <PauseCircle size={16} /> : <Radio size={16} />}{source.enabled ? "Pause" : "Start"}</button><button className="btn-secondary" onClick={() => test(source)}>Test</button><button className="icon-btn" onClick={() => remove(source)} title="Delete source"><Trash2 size={16} /></button></div></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Shell>
+  );
+}
+
 function ReportsPage() {
   const [reports, setReports] = useState([]);
   const load = () => api.get("/reports").then(({ data }) => setReports(data));
@@ -509,6 +632,35 @@ function CompetitorsPage() {
   const [data, setData] = useState([]);
   useEffect(() => { api.get("/analytics/competitors").then(({ data }) => setData(data)); }, []);
   return <Shell><h2 className="page-title">Competitor Comparison</h2><div className="card mt-5 h-[520px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={data}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="name" /><YAxis /><Tooltip /><Legend /><Bar dataKey="mentions" fill="#0ea5e9" /><Bar dataKey="engagement" fill="#22c55e" /><Bar dataKey="negative" fill="#ef4444" /></BarChart></ResponsiveContainer></div></Shell>;
+}
+
+function SetupPage() {
+  const [status, setStatus] = useState(null);
+  const load = useCallback(() => api.get("/setup/status").then(({ data }) => setStatus(data)), []);
+  useEffect(() => { load(); }, [load]);
+  useLiveRefresh(load);
+  const checks = [
+    ["API", status?.api === "running", "Express API responds on localhost."],
+    ["Database", status?.database === "connected", "MySQL is connected and schema is ready."],
+    ["Sources", Number(status?.sources || 0) > 0, `${status?.sources || 0} source presets or saved sources found.`],
+    ["Enabled", Number(status?.enabledSources || 0) > 0, `${status?.enabledSources || 0} live sources enabled.`],
+    ["Workers", Number(status?.workerCount || 0) > 0, `${status?.workerCount || 0} background workers active.`]
+  ];
+  return (
+    <Shell>
+      <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="page-title">Local Demo Setup</h2><p className="muted">Use this page before presenting the project.</p></div><button className="btn-primary" onClick={load}><RefreshCw size={16} /> Check now</button></div>
+      <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        {checks.map(([label, ok, detail]) => <div key={label} className="card"><div className="flex items-center gap-2 font-black">{ok ? <CheckCircle className="text-green-600" /> : <AlertTriangle className="text-amber-600" />}{label}</div><p className="muted mt-3">{detail}</p></div>)}
+      </div>
+      <div className="card mt-5">
+        <h3 className="section-title">Demo flow</h3>
+        <div className="mt-4 grid gap-3 md:grid-cols-4">
+          {["Log in with the demo user", "Open Live Sources and start RSS", "Watch dashboard metrics update", "Generate PDF or Excel report"].map((item) => <div className="rounded-lg bg-slate-50 p-4 text-sm font-bold text-slate-700" key={item}>{item}</div>)}
+        </div>
+        {status?.latestRun && <p className="muted mt-4">Latest source run: {status.latestRun.source_name} imported {status.latestRun.imported_count} and skipped {status.latestRun.skipped_count}.</p>}
+      </div>
+    </Shell>
+  );
 }
 
 function SettingsPage() {
@@ -550,16 +702,19 @@ function App() {
           <Route path="/register" element={<AuthPage type="register" />} />
           <Route path="/dashboard" element={<Protected><Dashboard /></Protected>} />
           <Route path="/topics/new" element={<Protected><TopicForm /></Protected>} />
+          <Route path="/sources" element={<Protected><LiveSourcesPage /></Protected>} />
           <Route path="/monitoring" element={<Protected><Monitoring /></Protected>} />
           <Route path="/sentiment" element={<Protected><SentimentPage /></Protected>} />
           <Route path="/summary" element={<Protected><SummaryPage /></Protected>} />
           <Route path="/alerts" element={<Protected><AlertsPage /></Protected>} />
           <Route path="/reports" element={<Protected><ReportsPage /></Protected>} />
           <Route path="/competitors" element={<Protected><CompetitorsPage /></Protected>} />
+          <Route path="/setup" element={<Protected><SetupPage /></Protected>} />
           <Route path="/settings" element={<Protected><SettingsPage /></Protected>} />
           <Route path="/admin" element={<Protected admin><AdminPage /></Protected>} />
           <Route path="/admin/users" element={<Protected admin><AdminTablePage title="Manage Users" endpoint="/admin/users" columns={["id", "name", "email", "role", "status", "created_at"]} /></Protected>} />
           <Route path="/admin/topics" element={<Protected admin><AdminTablePage title="Manage Topics" endpoint="/admin/topics" columns={["id", "name", "type", "owner", "created_at"]} /></Protected>} />
+          <Route path="/admin/sources" element={<Protected admin><AdminTablePage title="Manage Sources" endpoint="/admin/sources" columns={["id", "name", "type", "topic_name", "status", "enabled", "owner", "last_error", "created_at"]} /></Protected>} />
           <Route path="/admin/uploads" element={<Protected admin><AdminTablePage title="Manage Uploaded Data" endpoint="/admin/uploads" columns={["id", "file_name", "file_type", "row_count", "status", "owner", "created_at"]} /></Protected>} />
           <Route path="/admin/reports" element={<Protected admin><AdminTablePage title="Manage Reports" endpoint="/admin/reports" columns={["id", "type", "file_path", "owner", "created_at"]} /></Protected>} />
           <Route path="/admin/alerts" element={<Protected admin><AdminTablePage title="Manage Alerts" endpoint="/admin/alerts" columns={["id", "name", "condition_type", "threshold_value", "enabled", "owner", "created_at"]} /></Protected>} />

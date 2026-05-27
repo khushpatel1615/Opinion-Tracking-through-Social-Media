@@ -27,22 +27,42 @@ const app = express();
 const upload = multer({ dest: uploadDir });
 const PORT = Number(process.env.PORT || 5000);
 const JWT_SECRET = process.env.JWT_SECRET || "local-opiniontrack-secret";
+const liveClients = new Map();
+const sourceWorkers = new Map();
+let sourceReloadTimer = null;
 
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
 app.use(express.json({ limit: "5mb" }));
 
+function wrapAsync(fn) {
+  return function wrappedRoute(req, res, next) {
+    return Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+for (const method of ["get", "post", "put", "delete", "patch"]) {
+  const original = app[method].bind(app);
+  app[method] = (...args) => original(...args.map((arg) => (typeof arg === "function" ? wrapAsync(arg) : arg)));
+}
+
 function signToken(user) {
   return jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+async function userFromToken(token) {
+  const decoded = jwt.verify(token, JWT_SECRET);
+  const rows = await query("SELECT id,name,email,role,status,created_at FROM users WHERE id = ?", [decoded.id]);
+  if (!rows.length || rows[0].status !== "active") return null;
+  return rows[0];
 }
 
 async function auth(req, res, next) {
   try {
     const token = req.headers.authorization?.replace("Bearer ", "");
     if (!token) return res.status(401).json({ message: "Missing token" });
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const rows = await query("SELECT id,name,email,role,status,created_at FROM users WHERE id = ?", [decoded.id]);
-    if (!rows.length || rows[0].status !== "active") return res.status(401).json({ message: "Invalid user" });
-    req.user = rows[0];
+    const user = await userFromToken(token);
+    if (!user) return res.status(401).json({ message: "Invalid user" });
+    req.user = user;
     next();
   } catch {
     res.status(401).json({ message: "Invalid token" });
@@ -62,29 +82,75 @@ async function logAction(userId, action, ip) {
   await query("INSERT INTO security_logs (user_id, action, ip_address) VALUES (?,?,?)", [userId || null, action, ip || "localhost"]);
 }
 
+function csvTerms(value = "") {
+  return String(value)
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function stripHtml(value = "") {
+  return String(value).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function decodeXml(value = "") {
+  return String(value)
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'");
+}
+
+function sourceMatchesTopic(source, topic, text) {
+  const haystack = String(text || "").toLowerCase();
+  const terms = [...csvTerms(source.query), ...csvTerms(topic.keywords), topic.name?.toLowerCase()].filter(Boolean);
+  return terms.length === 0 || terms.some((term) => haystack.includes(term.replace(/^#/, "")));
+}
+
+function sendLiveEvent(userId, payload) {
+  const clients = liveClients.get(Number(userId)) || [];
+  const data = `data: ${JSON.stringify({ at: new Date().toISOString(), ...payload })}\n\n`;
+  clients.forEach((res) => res.write(data));
+}
+
+async function findTopicForSource(source, content) {
+  if (source.topic_id) {
+    const rows = await query("SELECT * FROM topics WHERE id=? AND user_id=?", [source.topic_id, source.user_id]);
+    if (rows.length) return rows[0];
+  }
+  const topics = await query("SELECT * FROM topics WHERE user_id=?", [source.user_id]);
+  return topics.find((topic) => sourceMatchesTopic(source, topic, content)) || topics[0] || null;
+}
+
 async function ensureTopic(userId, name, type = "keyword") {
   const topicName = name || "General";
   const existing = await query("SELECT * FROM topics WHERE user_id = ? AND name = ?", [userId, topicName]);
   if (existing.length) return existing[0];
   const colors = ["#0ea5e9", "#22c55e", "#f97316", "#8b5cf6", "#ef4444"];
-  const result = await query("INSERT INTO topics (user_id,name,type,description,color) VALUES (?,?,?,?,?)", [
+  const result = await query("INSERT INTO topics (user_id,name,type,description,color,keywords) VALUES (?,?,?,?,?,?)", [
     userId,
     topicName,
     type,
     "Created from uploaded data",
-    colors[Math.floor(Math.random() * colors.length)]
+    colors[Math.floor(Math.random() * colors.length)],
+    topicName
   ]);
   return { id: result.insertId, name: topicName, user_id: userId, type };
 }
 
 async function insertPost(userId, row) {
-  const topic = await ensureTopic(userId, row.topic || row.topicName || "General", row.type || "keyword");
+  let topic = row.topicId ? (await query("SELECT * FROM topics WHERE id=? AND user_id=?", [row.topicId, userId]))[0] : null;
+  if (!topic) topic = await ensureTopic(userId, row.topic || row.topicName || "General", row.type || "keyword");
   const sentiment = analyzeSentiment(row.content || "");
-  await query(
-    `INSERT INTO posts (topic_id, platform, author, content, posted_at, likes, shares, comments, url, sentiment_label, sentiment_score)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  const result = await query(
+    `INSERT IGNORE INTO posts
+     (topic_id, source_id, external_id, platform, author, content, posted_at, likes, shares, comments, url, source_url, language, fetched_at, sentiment_label, sentiment_score)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       topic.id,
+      row.sourceId || null,
+      row.externalId || null,
       row.platform || "Local",
       row.author || "anonymous",
       row.content || "",
@@ -93,10 +159,14 @@ async function insertPost(userId, row) {
       Number(row.shares || 0),
       Number(row.comments || 0),
       row.url || "",
+      row.sourceUrl || row.url || "",
+      row.language || "unknown",
+      row.fetchedAt ? new Date(row.fetchedAt) : new Date(),
       sentiment.label,
       sentiment.score
     ]
   );
+  return result.affectedRows > 0;
 }
 
 async function postsForUser(userId, topicId = null) {
@@ -178,6 +248,299 @@ async function checkAlerts(userId) {
   }
 }
 
+async function setSourceStatus(sourceId, status, error = "") {
+  await query("UPDATE sources SET status=?, last_error=?, last_run_at=NOW() WHERE id=?", [status, error, sourceId]);
+}
+
+async function recordRun(sourceId, status, imported, skipped, error = "") {
+  await query("INSERT INTO collection_runs (source_id,status,imported_count,skipped_count,error_message) VALUES (?,?,?,?,?)", [
+    sourceId,
+    status,
+    imported,
+    skipped,
+    error
+  ]);
+}
+
+function rssTags(xml, tag) {
+  return [...String(xml).matchAll(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "gi"))].map((match) => decodeXml(stripHtml(match[1])));
+}
+
+function parseRssItems(xml) {
+  const blocks = [...String(xml).matchAll(/<(item|entry)[^>]*>([\s\S]*?)<\/\1>/gi)].map((match) => match[2]);
+  return blocks.map((block, index) => {
+    const title = rssTags(block, "title")[0] || "";
+    const description = rssTags(block, "description")[0] || rssTags(block, "summary")[0] || rssTags(block, "content")[0] || "";
+    const link = rssTags(block, "link")[0] || (block.match(/<link[^>]+href=["']([^"']+)["']/i)?.[1] ?? "");
+    const date = rssTags(block, "pubDate")[0] || rssTags(block, "updated")[0] || rssTags(block, "published")[0] || new Date().toISOString();
+    const guid = rssTags(block, "guid")[0] || rssTags(block, "id")[0] || link || `${title}-${index}`;
+    return { title, description, link, date, guid, content: `${title}. ${description}`.trim() };
+  });
+}
+
+async function importSourceItem(source, item) {
+  const topic = await findTopicForSource(source, item.content);
+  if (!topic || !sourceMatchesTopic(source, topic, item.content)) return false;
+  const inserted = await insertPost(source.user_id, {
+    topicId: topic.id,
+    sourceId: source.id,
+    externalId: item.externalId,
+    platform: item.platform,
+    author: item.author,
+    content: item.content,
+    postedAt: item.postedAt,
+    url: item.url,
+    sourceUrl: item.sourceUrl || item.url,
+    language: item.language,
+    likes: item.likes,
+    shares: item.shares,
+    comments: item.comments
+  });
+  if (inserted) {
+    await query("UPDATE sources SET last_imported_at=NOW(), status='live', last_error='' WHERE id=?", [source.id]);
+    await checkAlerts(source.user_id);
+    sendLiveEvent(source.user_id, { type: "post_imported", sourceId: source.id, sourceName: source.name, platform: item.platform });
+  }
+  return inserted;
+}
+
+async function collectRss(source, testOnly = false) {
+  const response = await fetch(source.url, { headers: { "User-Agent": "OpinionTrack/1.0 local demo" } });
+  if (!response.ok) throw new Error(`RSS request failed with ${response.status}`);
+  const xml = await response.text();
+  const items = parseRssItems(xml).slice(0, testOnly ? 5 : 25);
+  let imported = 0;
+  let skipped = 0;
+  for (const item of items) {
+    if (!item.content) {
+      skipped += 1;
+      continue;
+    }
+    if (testOnly) {
+      imported += 1;
+      continue;
+    }
+    const ok = await importSourceItem(source, {
+      externalId: item.guid,
+      platform: "RSS",
+      author: new URL(source.url).hostname,
+      content: item.content,
+      postedAt: item.date,
+      url: item.link,
+      sourceUrl: item.link,
+      language: "unknown"
+    });
+    ok ? (imported += 1) : (skipped += 1);
+  }
+  return { imported, skipped, sampleCount: items.length };
+}
+
+async function testStreamingSource(source) {
+  if (source.type === "mastodon") {
+    const base = String(source.url || "https://mastodon.social").replace(/\/$/, "");
+    const response = await fetch(`${base}/api/v1/streaming/health`);
+    if (!response.ok) throw new Error(`Mastodon streaming health returned ${response.status}`);
+    return { ok: true, message: "Mastodon streaming endpoint is reachable." };
+  }
+  if (source.type === "bluesky") {
+    if (typeof WebSocket !== "function") return { ok: true, message: "Bluesky worker will use WebSocket when available in Node." };
+    await new Promise((resolve, reject) => {
+      const url = source.url || "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post";
+      const socket = new WebSocket(url);
+      const timer = setTimeout(() => {
+        socket.close();
+        reject(new Error("Bluesky connection timed out"));
+      }, 8000);
+      socket.onopen = () => {
+        clearTimeout(timer);
+        socket.close();
+        resolve();
+      };
+      socket.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("Bluesky WebSocket connection failed"));
+      };
+    });
+    return { ok: true, message: "Bluesky Jetstream is reachable." };
+  }
+  return { ok: true, message: "Connector stub is configured but disabled for the free MVP." };
+}
+
+async function runSourceOnce(source, testOnly = false) {
+  if (source.type === "rss") return collectRss(source, testOnly);
+  return testStreamingSource(source);
+}
+
+function startRssWorker(source) {
+  async function tick() {
+    let imported = 0;
+    let skipped = 0;
+    try {
+      await setSourceStatus(source.id, "polling");
+      const result = await collectRss(source);
+      imported = result.imported;
+      skipped = result.skipped;
+      await setSourceStatus(source.id, "live");
+      await recordRun(source.id, "success", imported, skipped);
+    } catch (error) {
+      await setSourceStatus(source.id, "error", error.message);
+      await recordRun(source.id, "error", imported, skipped, error.message);
+    }
+  }
+  tick();
+  const interval = setInterval(tick, Math.max(60, Number(source.poll_interval_seconds || 300)) * 1000);
+  sourceWorkers.set(source.id, { stop: () => clearInterval(interval) });
+}
+
+function startBlueskyWorker(source) {
+  if (typeof WebSocket !== "function") {
+    setSourceStatus(source.id, "error", "Node WebSocket is not available.");
+    return;
+  }
+  let stopped = false;
+  let reconnectTimer = null;
+  let importedThisMinute = 0;
+  const resetTimer = setInterval(() => {
+    importedThisMinute = 0;
+  }, 60000);
+  const connect = () => {
+    if (stopped) return;
+    const url = source.url || "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post";
+    const socket = new WebSocket(url);
+    sourceWorkers.set(source.id, {
+      stop: () => {
+        stopped = true;
+        clearInterval(resetTimer);
+        clearTimeout(reconnectTimer);
+        socket.close();
+      }
+    });
+    socket.onopen = () => setSourceStatus(source.id, "live");
+    socket.onmessage = async (event) => {
+      if (importedThisMinute >= 20) return;
+      try {
+        const payload = JSON.parse(event.data);
+        const record = payload.commit?.record;
+        if (payload.commit?.collection !== "app.bsky.feed.post" || !record?.text) return;
+        if (!sourceMatchesTopic(source, { name: "", keywords: source.query }, record.text)) return;
+        const ok = await importSourceItem(source, {
+          externalId: `${payload.did}:${payload.commit.rkey}`,
+          platform: "Bluesky",
+          author: payload.did,
+          content: record.text,
+          postedAt: record.createdAt || new Date(),
+          url: `https://bsky.app/profile/${payload.did}/post/${payload.commit.rkey}`,
+          language: record.langs?.[0] || "unknown"
+        });
+        if (ok) {
+          importedThisMinute += 1;
+          await recordRun(source.id, "success", 1, 0);
+        }
+      } catch (error) {
+        await setSourceStatus(source.id, "error", error.message);
+      }
+    };
+    socket.onerror = () => setSourceStatus(source.id, "error", "Bluesky stream error");
+    socket.onclose = () => {
+      if (!stopped) reconnectTimer = setTimeout(connect, 15000);
+    };
+  };
+  connect();
+}
+
+async function readSse(response, onEvent) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Streaming response is not readable.");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const dataLine = chunk.split("\n").find((line) => line.startsWith("data:"));
+      if (dataLine) await onEvent(dataLine.replace(/^data:\s*/, ""));
+    }
+  }
+}
+
+function startMastodonWorker(source) {
+  let stopped = false;
+  let controller = null;
+  let reconnectTimer = null;
+  let importedThisMinute = 0;
+  const resetTimer = setInterval(() => {
+    importedThisMinute = 0;
+  }, 60000);
+  const connect = async () => {
+    if (stopped) return;
+    try {
+      controller = new AbortController();
+      const base = String(source.url || "https://mastodon.social").replace(/\/$/, "");
+      const tag = encodeURIComponent(String(source.query || "").replace(/^#/, "").split(",")[0] || "opensource");
+      const streamUrl = `${base}/api/v1/streaming/hashtag?tag=${tag}`;
+      await setSourceStatus(source.id, "live");
+      const response = await fetch(streamUrl, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Mastodon stream returned ${response.status}`);
+      await readSse(response, async (line) => {
+        if (importedThisMinute >= 20) return;
+        const status = JSON.parse(line);
+        const content = stripHtml(status.content || "");
+        if (!content || !sourceMatchesTopic(source, { name: "", keywords: source.query }, content)) return;
+        const ok = await importSourceItem(source, {
+          externalId: status.id,
+          platform: "Mastodon",
+          author: status.account?.acct || "mastodon",
+          content,
+          postedAt: status.created_at || new Date(),
+          url: status.url,
+          language: status.language || "unknown",
+          likes: status.favourites_count,
+          shares: status.reblogs_count,
+          comments: status.replies_count
+        });
+        if (ok) {
+          importedThisMinute += 1;
+          await recordRun(source.id, "success", 1, 0);
+        }
+      });
+    } catch (error) {
+      if (!stopped) {
+        await setSourceStatus(source.id, "error", error.message);
+        reconnectTimer = setTimeout(connect, 15000);
+      }
+    }
+  };
+  sourceWorkers.set(source.id, {
+    stop: () => {
+      stopped = true;
+      clearInterval(resetTimer);
+      clearTimeout(reconnectTimer);
+      controller?.abort();
+    }
+  });
+  connect();
+}
+
+async function reloadSourceWorkers() {
+  const sources = await query("SELECT * FROM sources WHERE enabled = TRUE");
+  const active = new Set(sources.map((source) => source.id));
+  for (const [id, worker] of sourceWorkers.entries()) {
+    if (!active.has(id)) {
+      worker.stop();
+      sourceWorkers.delete(id);
+    }
+  }
+  for (const source of sources) {
+    if (sourceWorkers.has(source.id)) continue;
+    if (source.type === "rss") startRssWorker(source);
+    if (source.type === "bluesky") startBlueskyWorker(source);
+    if (source.type === "mastodon") startMastodonWorker(source);
+  }
+}
+
 app.get("/api/health", (req, res) => res.json({ ok: true, name: "OpinionTrack API" }));
 
 app.post("/api/auth/register", async (req, res) => {
@@ -205,13 +568,53 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/auth/me", auth, (req, res) => res.json({ user: req.user }));
 
+app.get("/api/live/events", async (req, res) => {
+  const token = req.query.token || req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ message: "Missing token" });
+  let user = null;
+  try {
+    user = await userFromToken(token);
+  } catch {
+    return res.status(401).json({ message: "Invalid token" });
+  }
+  if (!user) return res.status(401).json({ message: "Invalid token" });
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.write(`data: ${JSON.stringify({ type: "connected", at: new Date().toISOString() })}\n\n`);
+  const list = liveClients.get(user.id) || [];
+  list.push(res);
+  liveClients.set(user.id, list);
+  req.on("close", () => {
+    liveClients.set(user.id, (liveClients.get(user.id) || []).filter((client) => client !== res));
+  });
+});
+
+app.get("/api/setup/status", auth, async (req, res) => {
+  const [sourceCount] = await query("SELECT COUNT(*) AS total FROM sources WHERE user_id=?", [scopedUserId(req)]);
+  const [liveCount] = await query("SELECT COUNT(*) AS total FROM sources WHERE user_id=? AND enabled=TRUE", [scopedUserId(req)]);
+  const [latestRun] = await query(
+    `SELECT cr.*, s.name AS source_name FROM collection_runs cr JOIN sources s ON cr.source_id=s.id
+     WHERE s.user_id=? ORDER BY cr.created_at DESC LIMIT 1`,
+    [scopedUserId(req)]
+  );
+  res.json({
+    api: "running",
+    database: "connected",
+    sources: sourceCount.total,
+    enabledSources: liveCount.total,
+    latestRun: latestRun || null,
+    workerCount: sourceWorkers.size
+  });
+});
+
 app.get("/api/topics", auth, async (req, res) => {
   res.json(await query("SELECT * FROM topics WHERE user_id = ? ORDER BY created_at DESC", [scopedUserId(req)]));
 });
 app.post("/api/topics", auth, async (req, res) => {
-  const { name, type, description, color } = req.body;
-  const result = await query("INSERT INTO topics (user_id,name,type,description,color) VALUES (?,?,?,?,?)", [req.user.id, name, type, description || "", color || "#0ea5e9"]);
-  res.status(201).json({ id: result.insertId, name, type, description, color });
+  const { name, type, description, color, keywords } = req.body;
+  const result = await query("INSERT INTO topics (user_id,name,type,description,color,keywords) VALUES (?,?,?,?,?,?)", [req.user.id, name, type, description || "", color || "#0ea5e9", keywords || name]);
+  res.status(201).json({ id: result.insertId, name, type, description, color, keywords: keywords || name });
 });
 app.get("/api/topics/:id", auth, async (req, res) => {
   const rows = await query("SELECT * FROM topics WHERE id = ? AND user_id = ?", [req.params.id, scopedUserId(req)]);
@@ -219,13 +622,70 @@ app.get("/api/topics/:id", auth, async (req, res) => {
   res.json(rows[0]);
 });
 app.put("/api/topics/:id", auth, async (req, res) => {
-  const { name, type, description, color } = req.body;
-  await query("UPDATE topics SET name=?, type=?, description=?, color=? WHERE id=? AND user_id=?", [name, type, description, color, req.params.id, scopedUserId(req)]);
+  const { name, type, description, color, keywords } = req.body;
+  await query("UPDATE topics SET name=?, type=?, description=?, color=?, keywords=? WHERE id=? AND user_id=?", [name, type, description, color, keywords || name, req.params.id, scopedUserId(req)]);
   res.json({ message: "Topic updated" });
 });
 app.delete("/api/topics/:id", auth, async (req, res) => {
   await query("DELETE FROM topics WHERE id=? AND user_id=?", [req.params.id, scopedUserId(req)]);
   res.json({ message: "Topic deleted" });
+});
+
+app.get("/api/sources", auth, async (req, res) => {
+  const sources = await query(
+    `SELECT s.*, t.name AS topic_name,
+    (SELECT COUNT(*) FROM posts p WHERE p.source_id=s.id) AS post_count,
+    (SELECT COUNT(*) FROM collection_runs cr WHERE cr.source_id=s.id) AS run_count
+    FROM sources s LEFT JOIN topics t ON s.topic_id=t.id
+    WHERE s.user_id=? ORDER BY s.created_at DESC`,
+    [scopedUserId(req)]
+  );
+  res.json(sources);
+});
+
+app.post("/api/sources", auth, async (req, res) => {
+  const { name, type, topicId, query: sourceQuery, url, enabled = false, pollIntervalSeconds = 300 } = req.body;
+  if (!name || !type) return res.status(400).json({ message: "Name and type are required" });
+  const result = await query(
+    `INSERT INTO sources (user_id,name,type,topic_id,query,url,enabled,poll_interval_seconds,status)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [req.user.id, name, type, topicId || null, sourceQuery || "", url || "", Boolean(enabled), Number(pollIntervalSeconds || 300), enabled ? "starting" : "paused"]
+  );
+  await reloadSourceWorkers();
+  res.status(201).json({ id: result.insertId });
+});
+
+app.put("/api/sources/:id", auth, async (req, res) => {
+  const { name, type, topicId, query: sourceQuery, url, enabled, pollIntervalSeconds } = req.body;
+  await query(
+    `UPDATE sources SET name=?, type=?, topic_id=?, query=?, url=?, enabled=?, poll_interval_seconds=?, status=IF(?,'starting','paused')
+     WHERE id=? AND user_id=?`,
+    [name, type, topicId || null, sourceQuery || "", url || "", Boolean(enabled), Number(pollIntervalSeconds || 300), Boolean(enabled), req.params.id, scopedUserId(req)]
+  );
+  const worker = sourceWorkers.get(Number(req.params.id));
+  if (worker) {
+    worker.stop();
+    sourceWorkers.delete(Number(req.params.id));
+  }
+  await reloadSourceWorkers();
+  res.json({ message: "Source updated" });
+});
+
+app.delete("/api/sources/:id", auth, async (req, res) => {
+  const worker = sourceWorkers.get(Number(req.params.id));
+  if (worker) {
+    worker.stop();
+    sourceWorkers.delete(Number(req.params.id));
+  }
+  await query("DELETE FROM sources WHERE id=? AND user_id=?", [req.params.id, scopedUserId(req)]);
+  res.json({ message: "Source deleted" });
+});
+
+app.post("/api/sources/:id/test", auth, async (req, res) => {
+  const rows = await query("SELECT * FROM sources WHERE id=? AND user_id=?", [req.params.id, scopedUserId(req)]);
+  if (!rows.length) return res.status(404).json({ message: "Source not found" });
+  const result = await runSourceOnce(rows[0], true);
+  res.json(result.ok ? result : { ok: true, ...result });
 });
 
 app.post("/api/uploads/csv", auth, upload.single("file"), async (req, res) => {
@@ -234,21 +694,29 @@ app.post("/api/uploads/csv", auth, upload.single("file"), async (req, res) => {
     .pipe(csv())
     .on("data", (row) => rows.push(row))
     .on("end", async () => {
-      for (const row of rows) await insertPost(req.user.id, row);
-      await query("INSERT INTO uploads (user_id,file_name,file_type,row_count,status) VALUES (?,?,?,?,?)", [req.user.id, req.file.originalname, "csv", rows.length, "completed"]);
-      await checkAlerts(req.user.id);
-      fs.unlinkSync(req.file.path);
-      res.status(201).json({ imported: rows.length });
+      try {
+        let imported = 0;
+        for (const row of rows) if (await insertPost(req.user.id, row)) imported += 1;
+        await query("INSERT INTO uploads (user_id,file_name,file_type,row_count,status) VALUES (?,?,?,?,?)", [req.user.id, req.file.originalname, "csv", imported, "completed"]);
+        await checkAlerts(req.user.id);
+        fs.unlinkSync(req.file.path);
+        sendLiveEvent(req.user.id, { type: "upload_imported", imported, fileType: "csv" });
+        res.status(201).json({ imported });
+      } catch (error) {
+        res.status(500).json({ message: "Upload failed", detail: error.message });
+      }
     });
 });
 app.post("/api/uploads/json", auth, upload.single("file"), async (req, res) => {
   const raw = JSON.parse(fs.readFileSync(req.file.path, "utf8"));
   const rows = Array.isArray(raw) ? raw : raw.posts || [];
-  for (const row of rows) await insertPost(req.user.id, row);
-  await query("INSERT INTO uploads (user_id,file_name,file_type,row_count,status) VALUES (?,?,?,?,?)", [req.user.id, req.file.originalname, "json", rows.length, "completed"]);
+  let imported = 0;
+  for (const row of rows) if (await insertPost(req.user.id, row)) imported += 1;
+  await query("INSERT INTO uploads (user_id,file_name,file_type,row_count,status) VALUES (?,?,?,?,?)", [req.user.id, req.file.originalname, "json", imported, "completed"]);
   await checkAlerts(req.user.id);
   fs.unlinkSync(req.file.path);
-  res.status(201).json({ imported: rows.length });
+  sendLiveEvent(req.user.id, { type: "upload_imported", imported, fileType: "json" });
+  res.status(201).json({ imported });
 });
 
 app.get("/api/posts", auth, async (req, res) => {
@@ -378,19 +846,21 @@ app.post("/api/demo/refresh", auth, async (req, res) => {
     comments: Math.floor(Math.random() * 12)
   });
   await checkAlerts(req.user.id);
+  sendLiveEvent(req.user.id, { type: "demo_imported", sourceName: "Local Demo" });
   res.status(201).json({ message: "Demo post added" });
 });
 
 app.get("/api/admin/stats", auth, adminOnly, async (req, res) => {
-  const [[users], [topics], [reports], [alerts], [uploads], [posts]] = await Promise.all([
+  const [[users], [topics], [reports], [alerts], [uploads], [posts], [sources]] = await Promise.all([
     query("SELECT COUNT(*) AS total FROM users"),
     query("SELECT COUNT(*) AS total FROM topics"),
     query("SELECT COUNT(*) AS total FROM reports"),
     query("SELECT COUNT(*) AS total FROM alerts"),
     query("SELECT COUNT(*) AS total FROM uploads"),
-    query("SELECT COUNT(*) AS total FROM posts")
+    query("SELECT COUNT(*) AS total FROM posts"),
+    query("SELECT COUNT(*) AS total FROM sources")
   ]);
-  res.json({ users: users.total, topics: topics.total, reports: reports.total, alerts: alerts.total, uploads: uploads.total, posts: posts.total });
+  res.json({ users: users.total, topics: topics.total, sources: sources.total, reports: reports.total, alerts: alerts.total, uploads: uploads.total, posts: posts.total });
 });
 app.get("/api/admin/users", auth, adminOnly, async (req, res) => res.json(await query("SELECT id,name,email,role,status,created_at FROM users ORDER BY created_at DESC")));
 app.put("/api/admin/users/:id", auth, adminOnly, async (req, res) => {
@@ -404,13 +874,15 @@ app.delete("/api/admin/users/:id", auth, adminOnly, async (req, res) => {
 });
 app.get("/api/admin/topics", auth, adminOnly, async (req, res) => res.json(await query("SELECT t.*, u.email AS owner FROM topics t JOIN users u ON t.user_id=u.id ORDER BY t.created_at DESC")));
 app.get("/api/admin/uploads", auth, adminOnly, async (req, res) => res.json(await query("SELECT up.*, u.email AS owner FROM uploads up JOIN users u ON up.user_id=u.id ORDER BY up.created_at DESC")));
+app.get("/api/admin/sources", auth, adminOnly, async (req, res) => res.json(await query("SELECT s.*, u.email AS owner, t.name AS topic_name FROM sources s JOIN users u ON s.user_id=u.id LEFT JOIN topics t ON s.topic_id=t.id ORDER BY s.created_at DESC")));
 app.get("/api/admin/reports", auth, adminOnly, async (req, res) => res.json(await query("SELECT r.*, u.email AS owner FROM reports r JOIN users u ON r.user_id=u.id ORDER BY r.created_at DESC")));
 app.get("/api/admin/alerts", auth, adminOnly, async (req, res) => res.json(await query("SELECT a.*, u.email AS owner FROM alerts a JOIN users u ON a.user_id=u.id ORDER BY a.created_at DESC")));
 app.get("/api/admin/security-logs", auth, adminOnly, async (req, res) => res.json(await query("SELECT s.*, u.email AS owner FROM security_logs s LEFT JOIN users u ON s.user_id=u.id ORDER BY s.created_at DESC LIMIT 100")));
 app.get("/api/admin/settings", auth, adminOnly, async (req, res) => res.json(await query("SELECT * FROM settings ORDER BY setting_key")));
 app.put("/api/admin/settings", auth, adminOnly, async (req, res) => {
   const { settings } = req.body;
-  for (const item of settings || []) {
+  const items = Array.isArray(settings) ? settings : Object.values(settings || {});
+  for (const item of items.filter((entry) => entry?.setting_key)) {
     await query("INSERT INTO settings (setting_key,setting_value) VALUES (?,?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)", [item.setting_key, item.setting_value]);
   }
   res.json({ message: "Settings saved" });
@@ -421,6 +893,12 @@ app.use((error, req, res, next) => {
   res.status(500).json({ message: "Server error", detail: error.message });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`OpinionTrack API running on http://localhost:${PORT}`);
+  try {
+    await reloadSourceWorkers();
+    sourceReloadTimer = setInterval(() => reloadSourceWorkers().catch((error) => console.error(error)), 60000);
+  } catch (error) {
+    console.error("Live source workers could not start:", error.message);
+  }
 });

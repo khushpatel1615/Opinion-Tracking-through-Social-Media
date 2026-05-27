@@ -19,6 +19,14 @@ const demoPosts = [
   ["LinkedIn", "tom_growth", "Great local-first tool for students and small businesses tracking public opinion.", "2026-05-22T17:15:00Z", 63, 17, 9, "", "OpinionTrack"]
 ];
 
+async function safeQuery(sql) {
+  try {
+    await query(sql);
+  } catch (error) {
+    if (!/Duplicate|already exists/i.test(error.message)) throw error;
+  }
+}
+
 async function main() {
   const bootstrap = await mysql.createConnection({ ...dbConfig, database: undefined });
   await bootstrap.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
@@ -41,12 +49,34 @@ async function main() {
       type ENUM('keyword','hashtag','brand','competitor') NOT NULL DEFAULT 'keyword',
       description TEXT,
       color VARCHAR(20) DEFAULT '#0ea5e9',
+      keywords TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS sources (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      topic_id INT NULL,
+      name VARCHAR(160) NOT NULL,
+      type ENUM('bluesky','mastodon','rss','reddit','youtube') NOT NULL,
+      query TEXT,
+      url VARCHAR(700),
+      enabled BOOLEAN DEFAULT FALSE,
+      poll_interval_seconds INT DEFAULT 300,
+      status ENUM('paused','starting','live','polling','error') DEFAULT 'paused',
+      last_error TEXT,
+      last_run_at DATETIME NULL,
+      last_imported_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE SET NULL
     );
     CREATE TABLE IF NOT EXISTS posts (
       id INT AUTO_INCREMENT PRIMARY KEY,
       topic_id INT NOT NULL,
+      source_id INT NULL,
+      external_id VARCHAR(255),
       platform VARCHAR(80) NOT NULL,
       author VARCHAR(120) NOT NULL,
       content TEXT NOT NULL,
@@ -55,10 +85,25 @@ async function main() {
       shares INT DEFAULT 0,
       comments INT DEFAULT 0,
       url VARCHAR(500),
+      source_url VARCHAR(700),
+      language VARCHAR(40) DEFAULT 'unknown',
+      fetched_at DATETIME NULL,
       sentiment_label ENUM('positive','negative','neutral') NOT NULL,
       sentiment_score INT NOT NULL DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+      FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL,
+      UNIQUE KEY unique_source_post (source_id, external_id)
+    );
+    CREATE TABLE IF NOT EXISTS collection_runs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      source_id INT NOT NULL,
+      status ENUM('success','error') NOT NULL,
+      imported_count INT DEFAULT 0,
+      skipped_count INT DEFAULT 0,
+      error_message TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS uploads (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -115,6 +160,14 @@ async function main() {
     );
   `);
 
+  await safeQuery("ALTER TABLE topics ADD COLUMN IF NOT EXISTS keywords TEXT");
+  await safeQuery("ALTER TABLE posts ADD COLUMN IF NOT EXISTS source_id INT NULL");
+  await safeQuery("ALTER TABLE posts ADD COLUMN IF NOT EXISTS external_id VARCHAR(255)");
+  await safeQuery("ALTER TABLE posts ADD COLUMN IF NOT EXISTS source_url VARCHAR(700)");
+  await safeQuery("ALTER TABLE posts ADD COLUMN IF NOT EXISTS language VARCHAR(40) DEFAULT 'unknown'");
+  await safeQuery("ALTER TABLE posts ADD COLUMN IF NOT EXISTS fetched_at DATETIME NULL");
+  await safeQuery("ALTER TABLE posts ADD UNIQUE KEY IF NOT EXISTS unique_source_post (source_id, external_id)");
+
   const adminHash = await bcrypt.hash("Admin@12345", 10);
   const userHash = await bcrypt.hash("User@12345", 10);
   await query(
@@ -129,10 +182,31 @@ async function main() {
   const topicNames = ["OpinionTrack", "Competitor Pulse", "SignalBoard"];
   for (let i = 0; i < topicNames.length; i += 1) {
     await query(
-      "INSERT IGNORE INTO topics (user_id,name,type,description,color) SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM topics WHERE user_id = ? AND name = ?)",
-      [userId, topicNames[i], i === 0 ? "brand" : "competitor", "Seeded local demo topic", colors[i], userId, topicNames[i]]
+      "INSERT IGNORE INTO topics (user_id,name,type,description,color,keywords) SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM topics WHERE user_id = ? AND name = ?)",
+      [userId, topicNames[i], i === 0 ? "brand" : "competitor", "Seeded local demo topic", colors[i], topicNames[i], userId, topicNames[i]]
     );
   }
+
+  const [opinionTopic] = await query("SELECT id FROM topics WHERE user_id = ? AND name = ?", [userId, "OpinionTrack"]);
+  await query("UPDATE topics SET keywords = COALESCE(NULLIF(keywords,''), name)");
+  await query(
+    `INSERT INTO sources (user_id,topic_id,name,type,query,url,enabled,poll_interval_seconds,status)
+     SELECT ?, ?, 'Bluesky OpinionTrack stream', 'bluesky', 'opiniontrack, social listening, sentiment', 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post', FALSE, 60, 'paused'
+     WHERE NOT EXISTS (SELECT 1 FROM sources WHERE user_id=? AND name='Bluesky OpinionTrack stream')`,
+    [userId, opinionTopic.id, userId]
+  );
+  await query(
+    `INSERT INTO sources (user_id,topic_id,name,type,query,url,enabled,poll_interval_seconds,status)
+     SELECT ?, ?, 'Mastodon hashtag monitor', 'mastodon', 'opensource', 'https://mastodon.social', FALSE, 60, 'paused'
+     WHERE NOT EXISTS (SELECT 1 FROM sources WHERE user_id=? AND name='Mastodon hashtag monitor')`,
+    [userId, opinionTopic.id, userId]
+  );
+  await query(
+    `INSERT INTO sources (user_id,topic_id,name,type,query,url,enabled,poll_interval_seconds,status)
+     SELECT ?, ?, 'Tech news RSS monitor', 'rss', 'social media, sentiment, analytics', 'https://hnrss.org/frontpage', FALSE, 300, 'paused'
+     WHERE NOT EXISTS (SELECT 1 FROM sources WHERE user_id=? AND name='Tech news RSS monitor')`,
+    [userId, opinionTopic.id, userId]
+  );
 
   const existingPosts = await query("SELECT COUNT(*) AS total FROM posts");
   if (existingPosts[0].total === 0) {
